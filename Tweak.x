@@ -616,7 +616,14 @@ static BOOL GSIsCardApp(void) {
 // Santé / Forme : mode carte d'office. Ailleurs : activé dès qu'une carte arrondie
 // pleine largeur est détectée dans une UICollectionView (puis mise en page relancée).
 static BOOL gGSCardLayoutActive = YES;   // actif d'emblée : la 1re mise en page est déjà pleine largeur
-static inline BOOL GSCardLayoutActive(void) { return gGSCardLayoutActive || GSIsCardApp(); }
+// Vrai pendant le layoutSubviews d'une UICollectionView dont la mise en page a été
+// observée comme une GRILLE (cf. GSObserveGrid) : le mode carte est alors coupé pour
+// tous les hooks de layout, qui rendent les marges d'origine.
+static BOOL gGSPreparingGrid = NO;
+static inline BOOL GSCardLayoutActive(void) {
+    if (gGSPreparingGrid) return NO;
+    return gGSCardLayoutActive || GSIsCardApp();
+}
 
 static BOOL GSReturnsDirectionalInsets(Class cls, SEL sel) {
     Method m = class_getInstanceMethod(cls, sel);
@@ -689,26 +696,35 @@ static inline NSInteger GSMapInsetsReference(NSInteger ref) {
 // Un groupe à plusieurs colonnes (grille : horizontalGroup count:N, ou plusieurs
 // sous-items étroits côte à côte) n'est PAS une liste de cartes : ses marges latérales
 // sont de la mise en page, pas un inset de carte.
-static BOOL GSGroupIsMultiColumn(id g) {
-    if (!g) return NO;
+// Largeur "pleine" : fractionnaire >= 0.8 ou absolue >= 70 % de l'écran. Une largeur
+// ESTIMÉE (taille intrinsèque : icônes, pastilles) n'est PAS une carte pleine largeur.
+static BOOL GSDimensionIsFullWidth(NSCollectionLayoutDimension *w) {
+    if (!w) return YES;
+    CGFloat screenW = UIScreen.mainScreen.bounds.size.width;
+    if (w.isAbsolute) return w.dimension >= screenW * 0.7;
+    if (w.isFractionalWidth) return w.dimension >= 0.8;
+    return NO;
+}
+
+// Faux dès qu'un sous-item (ou sous-groupe, récursivement) n'est pas pleine largeur,
+// ou que le groupe répète un item N fois (grille). Avant : seulement si >= 2 sous-items
+// étroits, d'où les grosses icônes de Fichiers (UN item d'icône répété) collées au bord.
+static BOOL GSGroupHasNarrowItems(id g, NSUInteger depth) {
+    if (!g || depth > 3) return NO;
     @try {
         id c = [g valueForKey:@"count"];   // ivar privé _count ; lève si absent
         if ([c respondsToSelector:@selector(integerValue)] && [c integerValue] > 1) return YES;
     } @catch (NSException *e) {}
     SEL sSubs = NSSelectorFromString(@"subitems");
-    if ([g respondsToSelector:sSubs]) {
-        id subs = ((id (*)(id, SEL))objc_msgSend)(g, sSubs);
-        if ([subs isKindOfClass:[NSArray class]]) {
-            CGFloat screenW = UIScreen.mainScreen.bounds.size.width;
-            NSUInteger narrow = 0;
-            for (id it in (NSArray *)subs) {
-                if (![it isKindOfClass:[NSCollectionLayoutItem class]]) continue;
-                NSCollectionLayoutDimension *w = ((NSCollectionLayoutItem *)it).layoutSize.widthDimension;
-                if ((w.isFractionalWidth && w.dimension < 0.8) ||
-                    (w.isAbsolute && w.dimension < screenW * 0.7)) narrow++;
-            }
-            if (narrow >= 2) return YES;
-        }
+    if (![g respondsToSelector:sSubs]) return NO;
+    id subs = ((id (*)(id, SEL))objc_msgSend)(g, sSubs);
+    if (![subs isKindOfClass:[NSArray class]]) return NO;
+    Class supp = NSClassFromString(@"NSCollectionLayoutSupplementaryItem");
+    for (id it in (NSArray *)subs) {
+        if (![it isKindOfClass:[NSCollectionLayoutItem class]]) continue;
+        if (supp && [it isKindOfClass:supp]) continue;
+        if (!GSDimensionIsFullWidth(((NSCollectionLayoutItem *)it).layoutSize.widthDimension)) return YES;
+        if (GSGroupHasNarrowItems(it, depth + 1)) return YES;
     }
     return NO;
 }
@@ -722,7 +738,7 @@ static BOOL GSSectionIsFullWidthList(id section) {
     SEL sGroup = NSSelectorFromString(@"group");
     if ([section respondsToSelector:sGroup]) {
         id g = ((id (*)(id, SEL))objc_msgSend)(section, sGroup);
-        if (GSGroupIsMultiColumn(g)) return NO;
+        if (GSGroupHasNarrowItems(g, 0)) return NO;
         if ([g respondsToSelector:@selector(layoutSize)]) {
             NSCollectionLayoutSize *sz = [(NSCollectionLayoutItem *)g layoutSize];
             NSCollectionLayoutDimension *w = sz.widthDimension;
@@ -737,12 +753,7 @@ static BOOL GSSectionIsFullWidthList(id section) {
 
 static BOOL GSItemIsFullWidth(NSCollectionLayoutItem *item) {
     if ([item isKindOfClass:NSClassFromString(@"NSCollectionLayoutSupplementaryItem")]) return NO;
-    NSCollectionLayoutDimension *w = item.layoutSize.widthDimension;
-    if (!w) return YES;
-    CGFloat screenW = UIScreen.mainScreen.bounds.size.width;
-    if (w.isAbsolute) return w.dimension >= screenW * 0.7;
-    if (w.isFractionalWidth) return w.dimension >= 0.8;
-    return YES;
+    return GSDimensionIsFullWidth(item.layoutSize.widthDimension);
 }
 
 // --- Appartenance item/groupe -> section ------------------------------------------
@@ -804,12 +815,17 @@ static BOOL GSShouldZeroItemInsets(NSCollectionLayoutItem *item) {
 }
 
 static void *kGSOrigSectionInsetsKey = &kGSOrigSectionInsetsKey;
+static void *kGSOrigItemInsetsKey = &kGSOrigItemInsetsKey;
+static void *kGSOrigRefKey = &kGSOrigRefKey;
 
 %group CardSectionInsets
 %hook NSCollectionLayoutSection
 - (NSDirectionalEdgeInsets)contentInsets {
     NSDirectionalEdgeInsets o = %orig;
-    if (!GSCardLayoutActive()) return o;
+    if (!GSCardLayoutActive()) {
+        NSValue *orig = objc_getAssociatedObject(self, kGSOrigSectionInsetsKey);
+        return orig ? [orig directionalEdgeInsetsValue] : o;   // grille : marges d'origine
+    }
     GSEnsureSectionTagged(self);
     if (GSSectionIsFullWidthList(self)) return GSEdgeToEdge(o);
     NSValue *orig = objc_getAssociatedObject(self, kGSOrigSectionInsetsKey);
@@ -828,9 +844,13 @@ static void *kGSOrigSectionInsetsKey = &kGSOrigSectionInsetsKey;
 %hook NSCollectionLayoutItem
 - (NSDirectionalEdgeInsets)contentInsets {
     NSDirectionalEdgeInsets o = %orig;
+    NSValue *orig = objc_getAssociatedObject(self, kGSOrigItemInsetsKey);
+    if (orig) o = [orig directionalEdgeInsetsValue];   // valeur d'origine, jamais l'écriture filtrée
     return GSShouldZeroItemInsets(self) ? GSEdgeToEdgeIfSymmetric(o) : o;
 }
 - (void)setContentInsets:(NSDirectionalEdgeInsets)insets {
+    objc_setAssociatedObject(self, kGSOrigItemInsetsKey, [NSValue valueWithDirectionalEdgeInsets:insets],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     %orig(GSShouldZeroItemInsets(self) ? GSEdgeToEdgeIfSymmetric(insets) : insets);
 }
 %end
@@ -885,9 +905,12 @@ static void *kGSOrigSectionInsetsKey = &kGSOrigSectionInsetsKey;
 - (NSInteger)contentInsetsReference {
     NSInteger o = %orig;
     GSEnsureSectionTagged(self);
-    return (GSCardLayoutActive() && GSSectionIsFullWidthList(self)) ? GSMapInsetsReference(o) : o;
+    NSNumber *orig = objc_getAssociatedObject(self, kGSOrigRefKey);
+    NSInteger base = orig ? orig.integerValue : o;          // valeur d'origine, pas l'écriture filtrée
+    return (GSCardLayoutActive() && GSSectionIsFullWidthList(self)) ? GSMapInsetsReference(base) : base;
 }
 - (void)setContentInsetsReference:(NSInteger)ref {
+    objc_setAssociatedObject(self, kGSOrigRefKey, @(ref), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     %orig((GSCardLayoutActive() && GSSectionIsFullWidthList(self)) ? GSMapInsetsReference(ref) : ref);
 }
 %end
@@ -1124,11 +1147,55 @@ static void GSFlattenCellLevel(UICollectionViewCell *c) {
     }
 }
 
+// Filet de sécurité GÉOMÉTRIQUE : si deux cellules étroites sont côte à côte sur la même
+// ligne (cellules directes de la collection : les carrousels orthogonaux sont exclus),
+// la mise en page est une GRILLE, pas une liste de cartes. Elle est marquée (sur l'objet
+// layout : un autre layout, ex. bascule liste/icônes, est réévalué) et rendue telle quelle.
+static void *kGSGridLayoutKey = &kGSGridLayoutKey;
+
+static BOOL GSLayoutIsGrid(UICollectionView *cv) {
+    UICollectionViewLayout *l = cv.collectionViewLayout;
+    return l && [objc_getAssociatedObject(l, kGSGridLayoutKey) boolValue];
+}
+
+static void GSObserveGrid(UICollectionView *cv) {
+    if (GSIsCardApp() || GSLayoutIsGrid(cv) || GSLayoutScrollsHorizontally(cv)) return;
+    UIEdgeInsets safe = cv.safeAreaInsets;
+    CGFloat avail = cv.bounds.size.width - safe.left - safe.right;
+    if (avail <= 0) return;
+    NSMutableArray<UICollectionViewCell *> *cells = [NSMutableArray array];
+    for (UICollectionViewCell *c in cv.visibleCells) {
+        if (c.superview == cv && c.bounds.size.width < avail * 0.7 && c.bounds.size.width > 1) [cells addObject:c];
+        if (cells.count >= 40) break;
+    }
+    for (NSUInteger i = 0; i < cells.count; i++) {
+        CGRect a = cells[i].frame;
+        for (NSUInteger j = i + 1; j < cells.count; j++) {
+            CGRect b = cells[j].frame;
+            CGFloat overlapY = MIN(CGRectGetMaxY(a), CGRectGetMaxY(b)) - MAX(CGRectGetMinY(a), CGRectGetMinY(b));
+            BOOL sameRow = overlapY > 0.5 * MIN(a.size.height, b.size.height);
+            BOOL sideBySide = CGRectGetMaxX(a) <= b.origin.x + 1 || CGRectGetMaxX(b) <= a.origin.x + 1;
+            if (!(sameRow && sideBySide)) continue;
+            UICollectionViewLayout *l = cv.collectionViewLayout;
+            objc_setAssociatedObject(l, kGSGridLayoutKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            GSLog(@"GRILLE détectée : %@ layout=%@ cellule=%@ -> mode carte coupé pour ce layout",
+                  NSStringFromClass([cv class]), NSStringFromClass([l class]),
+                  NSStringFromClass([cells[i] class]));
+            [l invalidateLayout];   // même passe de layout : pas d'image intermédiaire visible
+            return;
+        }
+    }
+}
+
 %group CardCollectionTracker
 %hook UICollectionView
 - (void)layoutSubviews {
     gGSLastCV = self;
+    BOOL wasGrid = gGSPreparingGrid;
+    gGSPreparingGrid = GSLayoutIsGrid(self);   // les hooks de layout rendent alors l'origine
     %orig;
+    gGSPreparingGrid = wasGrid;
+    GSObserveGrid(self);
 }
 %end
 %end
