@@ -8,6 +8,7 @@
 #import <string.h>
 #import <stdlib.h>
 #import <errno.h>
+#import <sys/stat.h>
 
 // ---------------------------------------------------------------------------
 // GroupedSettings17 Addon for other Apps
@@ -112,15 +113,88 @@ static BOOL GSHasArgCount(Class cls, SEL sel, unsigned int count) {
     return m && method_getNumberOfArguments(m) == count;
 }
 
+// Méthode à un argument dont l'encodage commence par `prefix`.
+static BOOL GSTakesArg(Class cls, SEL sel, const char *prefix) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m || method_getNumberOfArguments(m) != 3) return NO;
+    char *t = method_copyArgumentType(m, 2);
+    BOOL ok = t && strncmp(t, prefix, strlen(prefix)) == 0;
+    free(t);
+    return ok;
+}
+
 // --- Préférence "addon.<bundle id>" (défaut : activé) ----------------------------------
 
-static BOOL GSIsEnabledForKey(NSString *key, BOOL defaultValue) {
+// POURQUOI UN MIROIR : dans une app (surtout sandboxée), lire le domaine d'un autre
+// paquet via cfprefsd peut renvoyer nil SANS erreur. Or "nil" voulait dire "valeur par
+// défaut", c'est-à-dire ACTIVÉ pour toutes les apps Apple : un interrupteur coupé dans
+// Réglages restait donc sans effet. Réglages (qui, lui, lit/écrit le domaine sans
+// problème) recopie maintenant toutes les clés "addon.*" dans un fichier plist lisible
+// par les apps (chemin jbroot, que le jailbreak ouvre aux processus injectés).
+// Ordre de lecture : cfprefsd -> miroir -> plist du domaine -> valeur par défaut.
+#define GS_MIRROR_A "/var/jb/var/mobile/Library/Preferences/com.raphetsoso.groupedsettings17addon.mirror.plist"
+#define GS_MIRROR_B "/var/mobile/Library/Preferences/com.raphetsoso.groupedsettings17addon.mirror.plist"
+#define GS_DOMAINFILE_A "/var/jb/var/mobile/Library/Preferences/com.raphetsoso.groupedsettings17.plist"
+#define GS_DOMAINFILE_B "/var/mobile/Library/Preferences/com.raphetsoso.groupedsettings17.plist"
+
+static NSDictionary *GSReadPlistAt(const char *path) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@(path)];
+    return [d isKindOfClass:[NSDictionary class]] ? d : nil;
+}
+
+static id GSStoredValue(NSString *key, const char **source) {
     CFPreferencesAppSynchronize(GS_DOMAIN);
-    id value = CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, GS_DOMAIN));
-    if (value && [value respondsToSelector:@selector(boolValue)]) {
-        return [value boolValue];
+    id v = CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, GS_DOMAIN));
+    if (v) { if (source) *source = "cfprefs"; return v; }
+
+    const char *mirrors[] = { GS_MIRROR_A, GS_MIRROR_B };
+    for (size_t i = 0; i < 2; i++) {
+        v = GSReadPlistAt(mirrors[i])[key];
+        if (v) { if (source) *source = "miroir"; return v; }
     }
-    return defaultValue;
+    const char *files[] = { GS_DOMAINFILE_A, GS_DOMAINFILE_B };
+    for (size_t i = 0; i < 2; i++) {
+        v = GSReadPlistAt(files[i])[key];
+        if (v) { if (source) *source = "plist"; return v; }
+    }
+    if (source) *source = "aucune";
+    return nil;
+}
+
+static BOOL GSIsEnabledForKey(NSString *key, BOOL defaultValue) {
+    const char *src = "aucune";
+    id value = GSStoredValue(key, &src);
+    BOOL result = (value && [value respondsToSelector:@selector(boolValue)])
+        ? [value boolValue] : defaultValue;
+    GSLog(@"pref %@ : valeur=%@ source=%s -> %@", key, value ?: @"(nil)", src,
+          result ? @"ACTIVÉ" : @"désactivé");
+    return result;
+}
+
+// Côté Réglages : recopie les clés "addon.*" du domaine vers le miroir.
+static void GSWriteMirror(void) {
+    CFPreferencesAppSynchronize(GS_DOMAIN);
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+    NSArray *keys = CFBridgingRelease(CFPreferencesCopyKeyList(GS_DOMAIN, kCFPreferencesCurrentUser,
+                                                              kCFPreferencesAnyHost));
+    for (id k in keys) {
+        if (![k isKindOfClass:[NSString class]] || ![(NSString *)k hasPrefix:@"addon."]) continue;
+        id v = CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)k, GS_DOMAIN));
+        if (v) m[k] = v;
+    }
+    const char *mirrors[] = { GS_MIRROR_A, GS_MIRROR_B };
+    BOOL wrote = NO;
+    for (size_t i = 0; i < 2; i++) {
+        NSString *path = @(mirrors[i]);
+        BOOL dirOK = [[NSFileManager defaultManager] fileExistsAtPath:[path stringByDeletingLastPathComponent]];
+        if (!dirOK) continue;
+        if ([GSReadPlistAt(mirrors[i]) isEqualToDictionary:m]) { wrote = YES; continue; }
+        if ([m writeToFile:path atomically:YES]) {
+            chmod(mirrors[i], 0644);
+            wrote = YES;
+        }
+    }
+    GSLog(@"miroir : %lu clé(s) addon.*, écrit=%d", (unsigned long)m.count, wrote);
 }
 
 // --- Aplatissement -----------------------------------------------------------
@@ -161,6 +235,18 @@ static UIBackgroundConfiguration *GSFlatConfiguration(UIBackgroundConfiguration 
 
 static void GSFlattenView(UIView *view) {
     if (view && view.layer.cornerRadius != 0) view.layer.cornerRadius = 0;
+}
+
+// Calque propre de la cellule : seulement si c'est le rayon "inset" (10 pt) ou des
+// coins partiels. Une cellule qui se dessine volontairement en carte n'est pas touchée ici
+// (les cartes sont traitées à part, par GSFlattenCardTree).
+static void GSFlattenOwnLayer(UIView *view) {
+    if (!view) return;
+    CGFloat r = view.layer.cornerRadius;
+    if (r == 0) return;
+    BOOL partial = view.layer.maskedCorners != (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
+                                                kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
+    if (fabs(r - GS_INSET_RADIUS) <= 0.5 || partial) view.layer.cornerRadius = 0;
 }
 
 // Défini plus bas (couche E) : aplatit les cartes arrondies quasi pleine largeur.
@@ -206,19 +292,17 @@ static void GSApplyTextMargins(UIView *owner, UIView *content) {
     }
 }
 
-// Balaie les vues de fond de la cellule, HORS contentView (les icônes et
-// contrôles y ont leurs propres rayons) : rayon ~10 pt ou coins partiels.
-static void GSFlattenBackgroundTree(UIView *view, UIView *skip, NSUInteger depth) {
-    if (depth > 4) return;
+// Balaie les vues de fond de la cellule, HORS contentView. Une vue de fond couvre
+// TOUTE la cellule : icônes, pastilles, vignettes et contrôles (qui ont leurs propres
+// rayons) ne la couvrent jamais, donc ne sont plus touchés.
+static void GSFlattenBackgroundTree(UIView *view, UIView *skip, CGSize cellSize, NSUInteger depth) {
+    if (depth > 3) return;
     for (UIView *sub in view.subviews) {
         if (sub == skip) continue;
-        CGFloat r = sub.layer.cornerRadius;
-        if (r != 0) {
-            BOOL partial = sub.layer.maskedCorners != (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
-                                                       kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
-            if (fabs(r - GS_INSET_RADIUS) <= 0.25 || partial) sub.layer.cornerRadius = 0;
-        }
-        GSFlattenBackgroundTree(sub, skip, depth + 1);
+        CGSize s = sub.bounds.size;
+        if (s.width < cellSize.width - 1.0 || s.height < cellSize.height - 1.0) continue;
+        if (sub.layer.cornerRadius != 0) sub.layer.cornerRadius = 0;
+        GSFlattenBackgroundTree(sub, skip, cellSize, depth + 1);
     }
 }
 
@@ -249,17 +333,38 @@ static void GSProbeCell(UITableViewCell *cell) {
 }
 #endif
 
-// Écrit directement les réglages privés de la table (plus fiable que hooker
-// leurs lecteurs, que UIKit peut ne pas appeler). Une seule fois par largeur.
-static void *kGSTableWidthKey = &kGSTableWidthKey;
+// Réglages privés de la table (inset / rayon de section) : UIKit peut les réécrire
+// (rotation, traits, zone sûre, relayout au défilement). Ils sont donc imposés de trois
+// façons : setters filtrés, getters filtrés, et revérification à chaque layout.
+// La revérification compare un "état" (largeur, classe de taille, inset brut) à celui
+// mémorisé juste APRÈS notre écriture : inchangé => rien à faire, donc jamais de boucle.
+static void *kGSTableStateKey = &kGSTableStateKey;
 
-static void GSForceTableFlat(UITableView *t) {
-    if (!(t.style == UITableViewStyleInsetGrouped || t.style == UITableViewStyleGrouped)) return;
-    if (!t.window) return;
-    CGFloat w = t.bounds.size.width;
-    NSNumber *last = objc_getAssociatedObject(t, kGSTableWidthKey);
-    if (last && fabs(last.doubleValue - w) < 0.5) return;
-    objc_setAssociatedObject(t, kGSTableWidthKey, @(w), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+static inline BOOL GSTableIsTarget(UITableView *t) {
+    return t && (t.style == UITableViewStyleInsetGrouped || t.style == UITableViewStyleGrouped);
+}
+
+static NSString *GSRawInsetString(UITableView *t) {
+    SEL sRaw = NSSelectorFromString(@"_rawSectionContentInset");
+    if (![t respondsToSelector:sRaw]) return @"";
+    UIEdgeInsets raw = ((UIEdgeInsets (*)(id, SEL))objc_msgSend)(t, sRaw);
+    return NSStringFromUIEdgeInsets(raw);
+}
+
+static NSString *GSTableStateKey(UITableView *t) {
+    return [NSString stringWithFormat:@"%.1f|%ld|%ld|%@",
+            t.bounds.size.width,
+            (long)t.traitCollection.horizontalSizeClass,
+            (long)t.traitCollection.userInterfaceIdiom,
+            GSRawInsetString(t)];
+}
+
+static void GSEnsureTableFlat(UITableView *t) {
+    if (!GSTableIsTarget(t) || !t.window) return;
+
+    NSString *state = GSTableStateKey(t);
+    NSString *last  = objc_getAssociatedObject(t, kGSTableStateKey);
+    if ([last isEqualToString:state]) return;
 
     SEL sFollow = NSSelectorFromString(@"_setSectionContentInsetFollowsLayoutMargins:");
     SEL sInset  = NSSelectorFromString(@"_setSectionContentInset:");
@@ -268,15 +373,14 @@ static void GSForceTableFlat(UITableView *t) {
     if ([t respondsToSelector:sInset])  ((void (*)(id, SEL, UIEdgeInsets))objc_msgSend)(t, sInset, UIEdgeInsetsZero);
     if ([t respondsToSelector:sRadius]) ((void (*)(id, SEL, CGFloat))objc_msgSend)(t, sRadius, 0);
 
+    objc_setAssociatedObject(t, kGSTableStateKey, GSTableStateKey(t), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
 #if GS_DEBUG
-    SEL sRaw = NSSelectorFromString(@"_rawSectionContentInset");
-    UIEdgeInsets raw = [t respondsToSelector:sRaw]
-        ? ((UIEdgeInsets (*)(id, SEL))objc_msgSend)(t, sRaw) : UIEdgeInsetsZero;
     id delegate = t.delegate;
     GSLog(@"TABLE %@ style=%ld delegate=%@ frame=%@ rawInset=%@ layoutMargins=%@",
           NSStringFromClass([t class]), (long)t.style,
           delegate ? NSStringFromClass([delegate class]) : @"nil",
-          NSStringFromCGRect(t.frame), NSStringFromUIEdgeInsets(raw),
+          NSStringFromCGRect(t.frame), GSRawInsetString(t),
           NSStringFromUIEdgeInsets(t.layoutMargins));
 #endif
 }
@@ -289,11 +393,11 @@ static void GSFlattenCell(UITableViewCell *cell) {
         UIBackgroundConfiguration *flat = GSFlatConfiguration(cfg);
         if (flat != cfg) cell.backgroundConfiguration = flat;
     }
-    GSFlattenView(cell);
+    GSFlattenOwnLayer(cell);
     GSFlattenView(cell.backgroundView);
     GSFlattenView(cell.selectedBackgroundView);
     GSFlattenView(cell.multipleSelectionBackgroundView);
-    GSFlattenBackgroundTree(cell, cell.contentView, 0);
+    GSFlattenBackgroundTree(cell, cell.contentView, cell.bounds.size, 0);
 
     // Carte arrondie posée dans la cellule : carrée, pleine largeur.
     CGFloat w = cell.bounds.size.width;
@@ -310,27 +414,67 @@ static void GSFlattenCell(UITableViewCell *cell) {
 // COUCHE B : UITableView
 // ===========================================================================
 
-%group TableContentInset
+%group TableContentInsetGet
 %hook UITableView
 - (UIEdgeInsets)_sectionContentInset {
-    return UIEdgeInsetsZero;
+    UIEdgeInsets orig = %orig;
+    return GSTableIsTarget(self) ? UIEdgeInsetsZero : orig;
 }
 %end
 %end
 
-%group TableSectionRadius
+%group TableContentInsetSet
+%hook UITableView
+- (void)_setSectionContentInset:(UIEdgeInsets)inset {
+    %orig(GSTableIsTarget(self) ? UIEdgeInsetsZero : inset);
+}
+%end
+%end
+
+%group TableSectionRadiusGet
 %hook UITableView
 - (CGFloat)_sectionCornerRadius {
-    return 0;
+    CGFloat orig = %orig;
+    return GSTableIsTarget(self) ? 0 : orig;
 }
 %end
 %end
 
-%group TableForce
+%group TableSectionRadiusSet
+%hook UITableView
+- (void)_setSectionCornerRadius:(CGFloat)radius {
+    %orig(GSTableIsTarget(self) ? 0 : radius);
+}
+%end
+%end
+
+%group TableFollowsMarginsSet
+%hook UITableView
+- (void)_setSectionContentInsetFollowsLayoutMargins:(BOOL)follows {
+    %orig(GSTableIsTarget(self) ? NO : follows);
+}
+%end
+%end
+
+// Passe pilotée par la table : une fois les cellules posées / recyclées par UIKit,
+// on aplatit chaque cellule visible. C'est ce qui rend le défilement déterministe
+// (une cellule fraîchement recyclée n'a pas forcément encore sa table en superview
+// au moment où ses propres hooks s'exécutent).
+%group TableDrive
 %hook UITableView
 - (void)layoutSubviews {
     %orig;
-    GSForceTableFlat(self);
+    if (!GSTableIsTarget(self)) return;
+    GSEnsureTableFlat(self);
+    for (UITableViewCell *cell in self.visibleCells) GSFlattenCell(cell);
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window && GSTableIsTarget(self)) {
+        GSEnsureTableFlat(self);
+        [self setNeedsLayout];
+    }
 }
 %end
 %end
@@ -542,6 +686,33 @@ static inline NSInteger GSMapInsetsReference(NSInteger ref) {
 // pas de défilement orthogonal (rails d'apps, carrousels) et un groupe qui
 // occupe toute la largeur. Les autres gardent leurs marges d'origine, sinon
 // leurs textes et vignettes se collent au bord de l'écran.
+// Un groupe à plusieurs colonnes (grille : horizontalGroup count:N, ou plusieurs
+// sous-items étroits côte à côte) n'est PAS une liste de cartes : ses marges latérales
+// sont de la mise en page, pas un inset de carte.
+static BOOL GSGroupIsMultiColumn(id g) {
+    if (!g) return NO;
+    @try {
+        id c = [g valueForKey:@"count"];   // ivar privé _count ; lève si absent
+        if ([c respondsToSelector:@selector(integerValue)] && [c integerValue] > 1) return YES;
+    } @catch (NSException *e) {}
+    SEL sSubs = NSSelectorFromString(@"subitems");
+    if ([g respondsToSelector:sSubs]) {
+        id subs = ((id (*)(id, SEL))objc_msgSend)(g, sSubs);
+        if ([subs isKindOfClass:[NSArray class]]) {
+            CGFloat screenW = UIScreen.mainScreen.bounds.size.width;
+            NSUInteger narrow = 0;
+            for (id it in (NSArray *)subs) {
+                if (![it isKindOfClass:[NSCollectionLayoutItem class]]) continue;
+                NSCollectionLayoutDimension *w = ((NSCollectionLayoutItem *)it).layoutSize.widthDimension;
+                if ((w.isFractionalWidth && w.dimension < 0.8) ||
+                    (w.isAbsolute && w.dimension < screenW * 0.7)) narrow++;
+            }
+            if (narrow >= 2) return YES;
+        }
+    }
+    return NO;
+}
+
 static BOOL GSSectionIsFullWidthList(id section) {
     SEL sOrth = NSSelectorFromString(@"orthogonalScrollingBehavior");
     if ([section respondsToSelector:sOrth]) {
@@ -551,6 +722,7 @@ static BOOL GSSectionIsFullWidthList(id section) {
     SEL sGroup = NSSelectorFromString(@"group");
     if ([section respondsToSelector:sGroup]) {
         id g = ((id (*)(id, SEL))objc_msgSend)(section, sGroup);
+        if (GSGroupIsMultiColumn(g)) return NO;
         if ([g respondsToSelector:@selector(layoutSize)]) {
             NSCollectionLayoutSize *sz = [(NSCollectionLayoutItem *)g layoutSize];
             NSCollectionLayoutDimension *w = sz.widthDimension;
@@ -864,8 +1036,31 @@ static void GSInsetPlainCell(UICollectionViewCell *cell, UICollectionView *cv) {
 
 static void *kGSCardCellKey = &kGSCardCellKey;
 
+// Mémoire par "genre" de cellule (classe + reuseIdentifier). Avant, le drapeau "carte"
+// était posé sur l'INSTANCE après sa première mise en page : une cellule neuve (créée au
+// défilement) ou recyclée restait "inconnue" (donc arrondie) un instant, puis se
+// redressait => effet "tantôt appliqué, tantôt non". Désormais, dès qu'une cellule d'un
+// genre est reconnue comme carte, toutes les suivantes du même genre le sont d'emblée.
+static NSMutableSet<NSString *> *GSCardKinds(void) {
+    static NSMutableSet *kinds;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ kinds = [NSMutableSet set]; });
+    return kinds;
+}
+
+static NSString *GSCellKind(UICollectionViewCell *cell) {
+    return [NSString stringWithFormat:@"%@|%@", NSStringFromClass([cell class]), cell.reuseIdentifier ?: @""];
+}
+
+static void GSMarkCardCell(UICollectionViewCell *cell) {
+    objc_setAssociatedObject(cell, kGSCardCellKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [GSCardKinds() addObject:GSCellKind(cell)];
+}
+
 static inline BOOL GSCellIsCard(UICollectionViewCell *cell) {
-    return GSIsCardApp() || [objc_getAssociatedObject(cell, kGSCardCellKey) boolValue];
+    return GSIsCardApp() ||
+           [objc_getAssociatedObject(cell, kGSCardCellKey) boolValue] ||
+           [GSCardKinds() containsObject:GSCellKind(cell)];
 }
 
 
@@ -882,7 +1077,7 @@ static BOOL GSCellLevelRounded(UICollectionViewCell *c) {
 }
 
 static BOOL GSCellIsCardCandidate(UICollectionViewCell *c) {
-    return GSIsCardApp() || [objc_getAssociatedObject(c, kGSCardCellKey) boolValue] || GSCellLevelRounded(c);
+    return GSCellIsCard(c) || GSCellLevelRounded(c);
 }
 
 // Élargit UNIQUEMENT une rangée verticale dont les marges latérales sont
@@ -946,7 +1141,7 @@ static void GSSquareRailCell(UICollectionViewCell *cell, UICollectionView *cv) {
     GSFlattenCellLevel(cell);
     CGFloat w = cell.bounds.size.width;
     if (w > 0) GSFlattenCardTree(cell, cell, w, 0);
-    objc_setAssociatedObject(cell, kGSCardCellKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // fond plat aussi
+    GSMarkCardCell(cell);   // fond plat aussi
 }
 
 static void GSFlattenCardCell(UICollectionViewCell *cell) {
@@ -970,8 +1165,8 @@ static void GSFlattenCardCell(UICollectionViewCell *cell) {
 
     if (!cardApp) {
         if (rounded || found) {
-            objc_setAssociatedObject(cell, kGSCardCellKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } else if (![objc_getAssociatedObject(cell, kGSCardCellKey) boolValue]) {
+            GSMarkCardCell(cell);
+        } else if (!GSCellIsCard(cell)) {
             // Pleine ligne sans carte arrondie (titre, texte seul) : pas aplatie,
             // mais elle récupère sa marge de texte.
             GSInsetPlainCell(cell, cv);
@@ -1052,6 +1247,7 @@ static void GSFlattenCardCell(UICollectionViewCell *cell) {
 - (void)didMoveToWindow {
     %orig;
     if (!self.window) return;
+    GSFlattenCardCell(self);   // tout de suite : pas d'image intermédiaire arrondie
     static const double delays[] = {0.0, 0.08, 0.3};
     for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
         __weak UICollectionViewCell *weakCell = self;
@@ -1141,12 +1337,22 @@ static void GSInstallUIKitHooks(void) {
 
         if (tableClass) {
             if (GSReturnsInsets(tableClass, @selector(_sectionContentInset))) {
-                %init(TableContentInset);
+                %init(TableContentInsetGet);
+            }
+            if (GSTakesArg(tableClass, NSSelectorFromString(@"_setSectionContentInset:"), "{UIEdgeInsets")) {
+                %init(TableContentInsetSet);
             }
             if (GSReturnsDouble(tableClass, @selector(_sectionCornerRadius))) {
-                %init(TableSectionRadius);
+                %init(TableSectionRadiusGet);
             }
-            %init(TableForce);
+            if (GSTakesArg(tableClass, NSSelectorFromString(@"_setSectionCornerRadius:"), "d")) {
+                %init(TableSectionRadiusSet);
+            }
+            SEL follows = NSSelectorFromString(@"_setSectionContentInsetFollowsLayoutMargins:");
+            if (GSTakesArg(tableClass, follows, "B") || GSTakesArg(tableClass, follows, "c")) {
+                %init(TableFollowsMarginsSet);
+            }
+            %init(TableDrive);
         }
         Class listConfig = objc_getClass("UICollectionLayoutListConfiguration");
         BOOL hasInit = listConfig && GSHasArgCount(listConfig, @selector(initWithAppearance:), 3);
@@ -1802,6 +2008,39 @@ static Class GSAddonListClass(void) {
         return specs;
     });
     class_addMethod(c, @selector(specifiers), imp, "@@:");
+
+    // Lecture / écriture des interrupteurs "addon.*" par le MÊME chemin que celui
+    // utilisé par les apps (cfprefsd, domaine GroupedSettings17) + recopie dans le
+    // miroir : l'interrupteur affiché = ce que l'app lira, et il ne "revient" plus.
+    SEL setSel = @selector(setPreferenceValue:specifier:);
+    SEL getSel = @selector(readPreferenceValue:);
+    Method superSetM = class_getInstanceMethod(sup, setSel);
+    Method superGetM = class_getInstanceMethod(sup, getSel);
+    IMP superSet = superSetM ? method_getImplementation(superSetM) : NULL;
+    IMP superGet = superGetM ? method_getImplementation(superGetM) : NULL;
+
+    IMP setImp = imp_implementationWithBlock(^(id me, id value, id specifier) {
+        if (superSet) ((void (*)(id, SEL, id, id))superSet)(me, setSel, value, specifier);
+        id key = [(PSSpecifier *)specifier propertyForKey:@"key"];
+        if ([key isKindOfClass:[NSString class]] && [(NSString *)key hasPrefix:@"addon."]) {
+            CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFPropertyListRef)value, GS_DOMAIN);
+            CFPreferencesAppSynchronize(GS_DOMAIN);
+            GSWriteMirror();
+            GSLog(@"interrupteur %@ = %@", key, value);
+        }
+    });
+    class_addMethod(c, setSel, setImp, "v@:@@");
+
+    IMP getImp = imp_implementationWithBlock(^id(id me, id specifier) {
+        id key = [(PSSpecifier *)specifier propertyForKey:@"key"];
+        if ([key isKindOfClass:[NSString class]] && [(NSString *)key hasPrefix:@"addon."]) {
+            id v = GSStoredValue((NSString *)key, NULL);
+            return v ?: [(PSSpecifier *)specifier propertyForKey:@"default"];
+        }
+        return superGet ? ((id (*)(id, SEL, id))superGet)(me, getSel, specifier) : nil;
+    });
+    class_addMethod(c, getSel, getImp, "@@:@");
+
     objc_registerClassPair(c);
     return c;
 }
@@ -1879,6 +2118,7 @@ static BOOL GSInstallPrefsMenu(void) {
 
         // Réglages : seulement l'ajout des interrupteurs dans le panneau GroupedSettings17.
         if ([bid isEqualToString:@"com.apple.Preferences"]) {
+            GSWriteMirror();   // les apps lisent ce miroir (cf. GSStoredValue)
             if (!GSInstallPrefsMenu()) {
                 // Le bundle de préférences est chargé à l'ouverture du panneau.
                 [[NSNotificationCenter defaultCenter]
